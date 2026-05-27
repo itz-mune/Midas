@@ -3,7 +3,10 @@ package com.example
 import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
@@ -13,8 +16,6 @@ import java.util.UUID
 
 @SuppressLint("MissingPermission")
 class HidManager(private val context: Context) {
-    private val TAG = "HidManager"
-
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
 
@@ -30,29 +31,43 @@ class HidManager(private val context: Context) {
     private val _pairedDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
     val pairedDevices = _pairedDevices.asStateFlow()
 
-    private var reportCharacteristic: BluetoothGattCharacteristic? = null
-    private var notificationsEnabled = false
+    private var mouseReportChar: BluetoothGattCharacteristic? = null
+    private var keyboardReportChar: BluetoothGattCharacteristic? = null
     private var connectedGattDevice: BluetoothDevice? = null
 
+    private val enabledNotifications = mutableSetOf<BluetoothGattCharacteristic>()
+
+    private val prefs = context.getSharedPreferences("midas_prefs", Context.MODE_PRIVATE)
+
+    private val bondReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+            if (state == BluetoothDevice.BOND_BONDED) updatePairedDevices()
+        }
+    }
+
     private val pendingServices = ArrayDeque<BluetoothGattService>()
+    private var pendingAdvertise = false
 
     private val gattCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            Log.d(TAG, "onConnectionStateChange: ${device.address}, state=$newState, status=$status")
+            Log.d(TAG, "onConnectionStateChange: ${device.address}, state=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectedGattDevice = device
                     _connectedDevice.value = device
                     _connectionState.value = BluetoothProfile.STATE_CONNECTED
                     stopAdvertising()
+                    prefs.edit().putString("last_device_address", device.address).apply()
                     updatePairedDevices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (connectedGattDevice?.address == device.address) {
                         connectedGattDevice = null
-                        notificationsEnabled = false
+                        enabledNotifications.clear()
                         _connectedDevice.value = null
                         _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
+                        updatePairedDevices()
                     }
                 }
             }
@@ -60,7 +75,12 @@ class HidManager(private val context: Context) {
 
         override fun onServiceAdded(status: Int, service: BluetoothGattService) {
             Log.d(TAG, "onServiceAdded: ${service.uuid}, status=$status")
-            addNextService()
+            if (pendingServices.isEmpty() && pendingAdvertise) {
+                pendingAdvertise = false
+                doStartAdvertising()
+            } else {
+                addNextService()
+            }
         }
 
         override fun onCharacteristicReadRequest(
@@ -96,8 +116,15 @@ class HidManager(private val context: Context) {
         ) {
             descriptor.value = value
             if (descriptor.uuid == UUID_CCC) {
-                notificationsEnabled = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                Log.d(TAG, "Notifications ${if (notificationsEnabled) "enabled" else "disabled"} by ${device.address}")
+                val char = descriptor.characteristic
+                if (char != null) {
+                    if (value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)) {
+                        enabledNotifications.add(char)
+                        Log.d(TAG, "Notifications enabled for ${char.uuid}")
+                    } else {
+                        enabledNotifications.remove(char)
+                    }
+                }
             }
             if (responseNeeded) gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
         }
@@ -107,6 +134,12 @@ class HidManager(private val context: Context) {
         gattServer = bluetoothManager?.openGattServer(context, gattCallback)
         pendingServices.addAll(listOf(createHidService(), createDeviceInfoService(), createBatteryService()))
         addNextService()
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(bondReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(bondReceiver, filter)
+        }
     }
 
     private fun addNextService() {
@@ -115,64 +148,88 @@ class HidManager(private val context: Context) {
 
     fun startAdvertising() {
         if (_connectionState.value != BluetoothProfile.STATE_DISCONNECTED) return
+
+        // Fast path: BLE link is still alive (soft disconnect), just resume the touchpad
+        if (connectedGattDevice != null) {
+            _connectedDevice.value = connectedGattDevice
+            _connectionState.value = BluetoothProfile.STATE_CONNECTED
+            return
+        }
+
+        // BLE link has dropped — need to advertise so Windows reconnects
+        _connectionState.value = BluetoothProfile.STATE_CONNECTING
+        if (gattServer == null) {
+            gattServer = bluetoothManager?.openGattServer(context, gattCallback)
+            if (gattServer == null) {
+                Log.e(TAG, "Failed to open GATT server")
+                _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
+                return
+            }
+            pendingAdvertise = true
+            pendingServices.clear()
+            pendingServices.addAll(listOf(createHidService(), createDeviceInfoService(), createBatteryService()))
+            addNextService()
+        } else {
+            doStartAdvertising()
+        }
+    }
+
+    private fun doStartAdvertising() {
         val adv = bluetoothAdapter?.bluetoothLeAdvertiser ?: run {
-            Log.e(TAG, "BLE advertising not supported on this device"); return
+            Log.e(TAG, "BLE advertising not supported")
+            _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
+            return
         }
         advertiser = adv
-        _connectionState.value = BluetoothProfile.STATE_CONNECTING
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setConnectable(true)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
-            .build()
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setConnectable(true).setTimeout(0)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH).build()
 
-        // HID service UUID in the primary ad packet; device name in scan response to avoid overflow
         val adData = AdvertiseData.Builder()
-            .addServiceUuid(ParcelUuid(SERVICE_HID))
-            .setIncludeTxPowerLevel(false)
-            .build()
+            .addServiceUuid(ParcelUuid(SERVICE_HID)).setIncludeTxPowerLevel(false).build()
 
-        val scanResponse = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .build()
+        val scanResp = AdvertiseData.Builder().setIncludeDeviceName(true).build()
 
-        adv.startAdvertising(settings, adData, scanResponse, advertiseCallback)
+        adv.startAdvertising(settings, adData, scanResp, advertiseCallback)
     }
 
     fun stopAdvertising() {
         advertiser?.stopAdvertising(advertiseCallback)
         advertiser = null
-        if (_connectionState.value == BluetoothProfile.STATE_CONNECTING) {
+        if (_connectionState.value == BluetoothProfile.STATE_CONNECTING)
             _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
-        }
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            Log.d(TAG, "BLE advertising started")
-        }
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) { Log.d(TAG, "Advertising started") }
         override fun onStartFailure(errorCode: Int) {
-            Log.e(TAG, "BLE advertising failed: $errorCode")
+            Log.e(TAG, "Advertising failed: $errorCode")
             _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
         }
     }
 
-    // Tapping a known device just starts advertising; the host will auto-reconnect if bonded
     fun connect(device: BluetoothDevice) = startAdvertising()
 
     fun disconnect() {
-        connectedGattDevice?.let { gattServer?.cancelConnection(it) }
+        pendingAdvertise = false
         stopAdvertising()
+        // Soft disconnect: keep the BLE link and GATT server alive.
+        // The link will supervision-timeout naturally, which Windows treats as
+        // "device disappeared" — not a clean user disconnect — so it will auto-reconnect
+        // the next time we advertise.
+        _connectedDevice.value = null
+        _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
+        updatePairedDevices()
+        // connectedGattDevice intentionally kept set
     }
 
-    fun sendMouseReport(
-        leftButton: Boolean, rightButton: Boolean, middleButton: Boolean,
-        dx: Int, dy: Int, scroll: Int
-    ) {
+    fun sendMouseReport(leftButton: Boolean, rightButton: Boolean, middleButton: Boolean, dx: Int, dy: Int, scroll: Int) {
         val device = connectedGattDevice ?: return
-        if (_connectionState.value != BluetoothProfile.STATE_CONNECTED || !notificationsEnabled) return
+        if (_connectionState.value != BluetoothProfile.STATE_CONNECTED) return
+        val char = mouseReportChar ?: return
+        if (!enabledNotifications.contains(char)) return
 
         var buttons = 0
         if (leftButton) buttons = buttons or 1
@@ -185,27 +242,48 @@ class HidManager(private val context: Context) {
             dy.coerceIn(-127, 127).toByte(),
             scroll.coerceIn(-127, 127).toByte()
         )
+        notify(device, char, report)
+    }
 
-        reportCharacteristic?.let { char ->
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gattServer?.notifyCharacteristicChanged(device, char, false, report)
-            } else {
-                @Suppress("DEPRECATION") char.value = report
-                @Suppress("DEPRECATION") gattServer?.notifyCharacteristicChanged(device, char, false)
-            }
+    fun sendKeyReport(modifier: Int, keycode: Int) {
+        val device = connectedGattDevice ?: return
+        if (_connectionState.value != BluetoothProfile.STATE_CONNECTED) return
+        val char = keyboardReportChar ?: return
+        if (!enabledNotifications.contains(char)) return
+
+        val report = byteArrayOf(modifier.toByte(), 0x00, keycode.toByte(), 0, 0, 0, 0, 0)
+        notify(device, char, report)
+    }
+
+    private fun notify(device: BluetoothDevice, char: BluetoothGattCharacteristic, value: ByteArray) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gattServer?.notifyCharacteristicChanged(device, char, false, value)
+        } else {
+            @Suppress("DEPRECATION")
+            char.value = value
+            @Suppress("DEPRECATION")
+            gattServer?.notifyCharacteristicChanged(device, char, false)
         }
     }
 
     fun updatePairedDevices() {
-        if (bluetoothAdapter?.isEnabled == true) {
-            _pairedDevices.value = bluetoothAdapter.bondedDevices.toList()
+        if (bluetoothAdapter?.isEnabled != true) return
+        val lastAddress = prefs.getString("last_device_address", null)
+        val devices = bluetoothAdapter.bondedDevices?.toList() ?: emptyList()
+        _pairedDevices.value = if (lastAddress != null) {
+            devices.sortedByDescending { it.address == lastAddress }
+        } else {
+            devices
         }
     }
 
     fun cleanup() {
         stopAdvertising()
-        gattServer?.close()
-        gattServer = null
+        try { context.unregisterReceiver(bondReceiver) } catch (_: Exception) {}
+        // Don't explicitly close the GATT server — let process death trigger a
+        // supervision timeout on Windows's side rather than a clean LL_TERMINATE_IND.
+        // Supervision timeout = "device disappeared" → Windows auto-reconnects next time.
+        // Clean disconnect = "device said goodbye" → Windows stops scanning.
     }
 
     // --- GATT service builders ---
@@ -217,44 +295,46 @@ class HidManager(private val context: Context) {
             PROP_READ or PROP_WRITE_NR, PERM_READ or PERM_WRITE, byteArrayOf(0x01)))
 
         service.addCharacteristic(char(CHAR_REPORT_MAP,
-            PROP_READ, PERM_READ, MOUSE_REPORT_DESC))
+            PROP_READ, PERM_READ, MOUSE_REPORT_DESC + KEYBOARD_REPORT_DESC))
 
-        // bcdHID=1.11, country=0, flags=NormallyConnectable|RemoteWake
         service.addCharacteristic(char(CHAR_HID_INFO,
             PROP_READ, PERM_READ, byteArrayOf(0x11, 0x01, 0x00, 0x03)))
 
         service.addCharacteristic(char(CHAR_HID_CONTROL_POINT,
             PROP_WRITE_NR, PERM_WRITE, byteArrayOf(0x00)))
 
-        val reportChar = BluetoothGattCharacteristic(
-            CHAR_REPORT, PROP_READ or PROP_NOTIFY, PERM_READ
-        ).apply { value = ByteArray(4) }
-        reportChar.addDescriptor(desc(UUID_CCC, PERM_READ or PERM_WRITE,
-            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))
-        reportChar.addDescriptor(desc(UUID_REPORT_REF, PERM_READ,
-            byteArrayOf(0x01, 0x01))) // Report ID=1, Input Report
-        service.addCharacteristic(reportChar)
-        reportCharacteristic = reportChar
+        // Mouse input report — Report ID 1
+        val mouse = BluetoothGattCharacteristic(CHAR_REPORT, PROP_READ or PROP_NOTIFY, PERM_READ)
+            .apply { value = ByteArray(4) }
+        mouse.addDescriptor(desc(UUID_CCC, PERM_READ or PERM_WRITE, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))
+        mouse.addDescriptor(desc(UUID_REPORT_REF, PERM_READ, byteArrayOf(0x01, 0x01)))
+        service.addCharacteristic(mouse)
+        mouseReportChar = mouse
+
+        // Keyboard input report — Report ID 2
+        val keyboard = BluetoothGattCharacteristic(CHAR_REPORT, PROP_READ or PROP_NOTIFY, PERM_READ)
+            .apply { value = ByteArray(8) }
+        keyboard.addDescriptor(desc(UUID_CCC, PERM_READ or PERM_WRITE, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))
+        keyboard.addDescriptor(desc(UUID_REPORT_REF, PERM_READ, byteArrayOf(0x02, 0x01)))
+        service.addCharacteristic(keyboard)
+        keyboardReportChar = keyboard
 
         return service
     }
 
     private fun createDeviceInfoService(): BluetoothGattService {
         val service = BluetoothGattService(SERVICE_DEVICE_INFO, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        // PnP ID: source=USB(0x02), VID=0x0000, PID=0x0000, version=0x0001
-        service.addCharacteristic(char(CHAR_PNP_ID,
-            PROP_READ, PERM_READ, byteArrayOf(0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00)))
+        service.addCharacteristic(char(CHAR_PNP_ID, PROP_READ, PERM_READ,
+            byteArrayOf(0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00)))
         return service
     }
 
     private fun createBatteryService(): BluetoothGattService {
         val service = BluetoothGattService(SERVICE_BATTERY, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        val battChar = BluetoothGattCharacteristic(
-            CHAR_BATTERY_LEVEL, PROP_READ or PROP_NOTIFY, PERM_READ
-        ).apply { value = byteArrayOf(100) }
-        battChar.addDescriptor(desc(UUID_CCC, PERM_READ or PERM_WRITE,
-            BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))
-        service.addCharacteristic(battChar)
+        val batt = BluetoothGattCharacteristic(CHAR_BATTERY_LEVEL, PROP_READ or PROP_NOTIFY, PERM_READ)
+            .apply { value = byteArrayOf(100) }
+        batt.addDescriptor(desc(UUID_CCC, PERM_READ or PERM_WRITE, BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE))
+        service.addCharacteristic(batt)
         return service
     }
 
@@ -265,6 +345,8 @@ class HidManager(private val context: Context) {
         BluetoothGattDescriptor(uuid, permissions).apply { this.value = value }
 
     companion object {
+        private const val TAG = "HidManager"
+
         private val PROP_READ     = BluetoothGattCharacteristic.PROPERTY_READ
         private val PROP_NOTIFY   = BluetoothGattCharacteristic.PROPERTY_NOTIFY
         private val PROP_WRITE_NR = BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
@@ -287,39 +369,34 @@ class HidManager(private val context: Context) {
         val UUID_REPORT_REF = UUID.fromString("00002908-0000-1000-8000-00805f9b34fb")
 
         val MOUSE_REPORT_DESC: ByteArray = byteArrayOf(
-            0x05, 0x01,              // Usage Page (Generic Desktop)
-            0x09, 0x02,              // Usage (Mouse)
-            0xA1.toByte(), 0x01,     // Collection (Application)
-            0x85.toByte(), 0x01,     //   Report ID (1)
-            0x09, 0x01,              //   Usage (Pointer)
-            0xA1.toByte(), 0x00,     //   Collection (Physical)
-            0x05, 0x09,              //     Usage Page (Button)
-            0x19, 0x01,              //     Usage Minimum (1)
-            0x29, 0x03,              //     Usage Maximum (3)
-            0x15, 0x00,              //     Logical Minimum (0)
-            0x25, 0x01,              //     Logical Maximum (1)
-            0x95.toByte(), 0x03,     //     Report Count (3)
-            0x75, 0x01,              //     Report Size (1)
-            0x81.toByte(), 0x02,     //     Input (Data, Var, Abs) — buttons
-            0x95.toByte(), 0x01,     //     Report Count (1)
-            0x75, 0x05,              //     Report Size (5)
-            0x81.toByte(), 0x03,     //     Input (Const) — padding
-            0x05, 0x01,              //     Usage Page (Generic Desktop)
-            0x09, 0x30,              //     Usage (X)
-            0x09, 0x31,              //     Usage (Y)
-            0x15, 0x81.toByte(),     //     Logical Minimum (-127)
-            0x25, 0x7F,              //     Logical Maximum (127)
-            0x75, 0x08,              //     Report Size (8)
-            0x95.toByte(), 0x02,     //     Report Count (2)
-            0x81.toByte(), 0x06,     //     Input (Data, Var, Rel) — X/Y
-            0x09, 0x38,              //     Usage (Wheel)
-            0x15, 0x81.toByte(),     //     Logical Minimum (-127)
-            0x25, 0x7F,              //     Logical Maximum (127)
-            0x75, 0x08,              //     Report Size (8)
-            0x95.toByte(), 0x01,     //     Report Count (1)
-            0x81.toByte(), 0x06,     //     Input (Data, Var, Rel) — scroll
-            0xC0.toByte(),           //   End Collection
-            0xC0.toByte()            // End Collection
+            0x05, 0x01, 0x09, 0x02, 0xA1.toByte(), 0x01,
+            0x85.toByte(), 0x01,                         // Report ID 1
+            0x09, 0x01, 0xA1.toByte(), 0x00,
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x03,
+            0x15, 0x00, 0x25, 0x01, 0x95.toByte(), 0x03, 0x75, 0x01,
+            0x81.toByte(), 0x02,                         // buttons
+            0x95.toByte(), 0x01, 0x75, 0x05, 0x81.toByte(), 0x03, // padding
+            0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+            0x15, 0x81.toByte(), 0x25, 0x7F, 0x75, 0x08, 0x95.toByte(), 0x02,
+            0x81.toByte(), 0x06,                         // X/Y
+            0x09, 0x38, 0x15, 0x81.toByte(), 0x25, 0x7F, 0x75, 0x08, 0x95.toByte(), 0x01,
+            0x81.toByte(), 0x06,                         // scroll
+            0xC0.toByte(), 0xC0.toByte()
+        )
+
+        val KEYBOARD_REPORT_DESC: ByteArray = byteArrayOf(
+            0x05, 0x01, 0x09, 0x06, 0xA1.toByte(), 0x01,
+            0x85.toByte(), 0x02,                         // Report ID 2
+            0x05, 0x07,
+            0x19, 0xE0.toByte(), 0x29, 0xE7.toByte(),   // modifier keys
+            0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95.toByte(), 0x08,
+            0x81.toByte(), 0x02,
+            0x95.toByte(), 0x01, 0x75, 0x08, 0x81.toByte(), 0x03, // reserved
+            0x95.toByte(), 0x06, 0x75, 0x08,            // 6 keycodes
+            0x15, 0x00, 0x25, 0x65,
+            0x05, 0x07, 0x19, 0x00, 0x29, 0x65,
+            0x81.toByte(), 0x00,
+            0xC0.toByte()
         )
     }
 }

@@ -7,51 +7,49 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.scaleIn
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bluetooth
-import androidx.compose.material.icons.filled.BluetoothConnected
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.draw.clip
-import androidx.compose.foundation.border
-import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
@@ -60,12 +58,30 @@ import com.example.ui.theme.MyApplicationTheme
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.MultiplePermissionsState
 import com.google.accompanist.permissions.rememberMultiplePermissionsState
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
-import androidx.compose.ui.input.pointer.positionChange
-import androidx.compose.material.icons.filled.*
+import androidx.compose.foundation.Canvas
 import android.annotation.SuppressLint
+
+// Maps a character to (modifier, HID keycode). Returns (0, 0) for unmapped chars.
+private fun charToHidKeycode(char: Char): Pair<Int, Int> = when (char) {
+    in 'a'..'z' -> 0 to (char.code - 'a'.code + 0x04)
+    in 'A'..'Z' -> 0x02 to (char.code - 'A'.code + 0x04)
+    in '1'..'9' -> 0 to (char.code - '1'.code + 0x1E)
+    '0'  -> 0 to 0x27;  ' '  -> 0 to 0x2C;  '\n' -> 0 to 0x28;  '\t' -> 0 to 0x2B
+    '!'  -> 0x02 to 0x1E; '@' -> 0x02 to 0x1F; '#' -> 0x02 to 0x20; '$' -> 0x02 to 0x21
+    '%'  -> 0x02 to 0x22; '^' -> 0x02 to 0x23; '&' -> 0x02 to 0x24; '*' -> 0x02 to 0x25
+    '('  -> 0x02 to 0x26; ')' -> 0x02 to 0x27
+    '-'  -> 0 to 0x2D;   '_' -> 0x02 to 0x2D; '=' -> 0 to 0x2E;   '+' -> 0x02 to 0x2E
+    '['  -> 0 to 0x2F;   '{' -> 0x02 to 0x2F; ']' -> 0 to 0x30;   '}' -> 0x02 to 0x30
+    '\\' -> 0 to 0x31;   '|' -> 0x02 to 0x31
+    ';'  -> 0 to 0x33;   ':' -> 0x02 to 0x33; '\'' -> 0 to 0x34;  '"' -> 0x02 to 0x34
+    '`'  -> 0 to 0x35;   '~' -> 0x02 to 0x35
+    ','  -> 0 to 0x36;   '<' -> 0x02 to 0x36; '.' -> 0 to 0x37;   '>' -> 0x02 to 0x37
+    '/'  -> 0 to 0x38;   '?' -> 0x02 to 0x38
+    else -> 0 to 0
+}
 
 @SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
@@ -75,34 +91,24 @@ class MainActivity : ComponentActivity() {
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as BluetoothHidService.LocalBinder
-            val hidService = binder.getService()
-            viewModel.attachService(hidService)
+            viewModel.attachService(binder.getService())
         }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-        }
+        override fun onServiceDisconnected(name: ComponentName?) {}
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         enableEdgeToEdge()
-
         setContent {
             viewModel = viewModel()
-            MyApplicationTheme {
-                MainScreen(viewModel, serviceConnection)
-            }
+            MyApplicationTheme { MainScreen(viewModel, serviceConnection) }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            unbindService(serviceConnection)
-        } catch (e: Exception) {
-            // Ignore if not bound
-        }
+        try { unbindService(serviceConnection) } catch (_: Exception) {}
     }
 }
 
@@ -113,37 +119,22 @@ fun MainScreen(viewModel: TouchpadViewModel, serviceConnection: ServiceConnectio
     val isServiceConnected by viewModel.isServiceConnected.collectAsState()
 
     val bluetoothPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        listOf(
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.BLUETOOTH_ADVERTISE
-        )
+        listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
     } else {
-        listOf(
-            Manifest.permission.BLUETOOTH,
-            Manifest.permission.BLUETOOTH_ADMIN
-        )
+        listOf(Manifest.permission.BLUETOOTH, Manifest.permission.BLUETOOTH_ADMIN)
     }
 
     val permissionsState = rememberMultiplePermissionsState(permissions = bluetoothPermissions)
 
     if (permissionsState.allPermissionsGranted) {
         LaunchedEffect(Unit) {
-            val serviceIntent = Intent(context, BluetoothHidService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
-            }
-            context.bindService(serviceIntent, serviceConnection, Context.BIND_AUTO_CREATE)
+            val intent = Intent(context, BluetoothHidService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
+            else context.startService(intent)
+            context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
-
-        if (isServiceConnected) {
-            TouchpadApp(viewModel)
-        } else {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
-            }
-        }
+        if (isServiceConnected) TouchpadApp(viewModel)
+        else Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
     } else {
         PermissionScreen(permissionsState)
     }
@@ -153,28 +144,16 @@ fun MainScreen(viewModel: TouchpadViewModel, serviceConnection: ServiceConnectio
 @Composable
 fun PermissionScreen(permissionsState: MultiplePermissionsState) {
     Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
+        modifier = Modifier.fillMaxSize().padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text(
-            text = "Bluetooth Permissions Required",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = "This app needs Bluetooth permissions to act as an HID touchpad.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        Button(
-            onClick = { permissionsState.launchMultiplePermissionRequest() },
-            shape = RoundedCornerShape(24.dp)
-        ) {
+        Text("Bluetooth Permissions Required", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        Text("This app needs Bluetooth permissions to act as an HID touchpad.",
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.height(16.dp))
+        Button(onClick = { permissionsState.launchMultiplePermissionRequest() }, shape = RoundedCornerShape(24.dp)) {
             Text("Grant Permissions")
         }
     }
@@ -188,112 +167,103 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
     val connectionState by viewModel.connectionState.collectAsState()
     val connectedDevice by viewModel.connectedDevice.collectAsState()
     val pairedDevices by viewModel.pairedDevices.collectAsState()
+    val settings by viewModel.settings.collectAsState()
 
     var showDevicePicker by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var showKeyboard by remember { mutableStateOf(false) }
 
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        modifier = Modifier.fillMaxSize()
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-        ) {
-            // Status Top Bar
+    LaunchedEffect(connectionState) {
+        if (connectionState == BluetoothProfile.STATE_CONNECTED) showDevicePicker = false
+        if (connectionState == BluetoothProfile.STATE_DISCONNECTED) showKeyboard = false
+    }
+
+    Scaffold(containerColor = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) { innerPadding ->
+        Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
+
+            // Top bar
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.clickable { showDevicePicker = true }) {
-                    Text(
-                        text = "MIDAS",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 2.sp
-                        ),
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = "Virtual Touchpad",
-                        style = MaterialTheme.typography.titleMedium.copy(
-                            fontWeight = FontWeight.Medium
-                        ),
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
+                    Text("MIDAS",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold, letterSpacing = 2.sp),
+                        color = MaterialTheme.colorScheme.primary)
+                    Text("Virtual Touchpad",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Medium),
+                        color = MaterialTheme.colorScheme.onBackground)
                 }
                 ConnectionStatusPill(connectionState, connectedDevice, onClick = { showDevicePicker = true })
             }
 
-            // Main Touchpad Surface Container
+            // Touchpad + keyboard area
             Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 16.dp)
+                modifier = Modifier.weight(1f).padding(horizontal = 16.dp).padding(bottom = 16.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                ) {
-                    TouchpadSurface(viewModel)
+                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    TouchpadSurface(viewModel, settings)
+                    if (connectionState != BluetoothProfile.STATE_CONNECTED) {
+                        QuickConnectOverlay(
+                            connectionState = connectionState,
+                            pairedDevices = pairedDevices,
+                            onConnect = { device ->
+                                if (device != null) viewModel.connectDevice(device)
+                                else viewModel.startAdvertising()
+                            },
+                            onCancel = { viewModel.disconnect() }
+                        )
+                    }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                // Keyboard input area
+                if (showKeyboard && settings.keyboardEnabled) {
+                    KeyboardInputArea(viewModel, onDismiss = { showKeyboard = false })
+                }
 
-                // Quick Settings Controls
+                Spacer(Modifier.height(16.dp))
+
+                // Bottom controls
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(48.dp)
-                        .padding(horizontal = 8.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp).padding(horizontal = 8.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        // Settings button
                         IconButton(
-                            onClick = { /* TODO */ },
-                            modifier = Modifier
-                                .size(40.dp)
-                                .background(com.example.ui.theme.ButtonBg36343B, CircleShape)
+                            onClick = { showSettings = true },
+                            modifier = Modifier.size(40.dp).background(com.example.ui.theme.ButtonBg36343B, CircleShape)
                         ) {
-                            Icon(
-                                Icons.Default.Settings,
-                                contentDescription = "Settings",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Icon(Icons.Default.Settings, contentDescription = "Settings",
+                                tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                         }
-                        Text(
-                            text = "Sensitivity: High",
+                        Text("Sensitivity: ${sensitivityLabel(settings.sensitivity)}",
                             style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(modifier = Modifier.size(8.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
-                        Box(modifier = Modifier.size(8.dp).background(MaterialTheme.colorScheme.outline, CircleShape))
+
+                    // Keyboard toggle (only when connected and keyboard feature is on)
+                    if (settings.keyboardEnabled && connectionState == BluetoothProfile.STATE_CONNECTED) {
+                        IconButton(
+                            onClick = { showKeyboard = !showKeyboard },
+                            modifier = Modifier.size(40.dp).background(
+                                if (showKeyboard) MaterialTheme.colorScheme.primary else com.example.ui.theme.ButtonBg36343B,
+                                CircleShape
+                            )
+                        ) {
+                            Icon(Icons.Default.Keyboard, contentDescription = "Keyboard",
+                                tint = if (showKeyboard) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(20.dp))
+                        }
                     }
                 }
             }
         }
     }
 
-    // Auto-close picker once the host connects
-    LaunchedEffect(connectionState) {
-        if (connectionState == BluetoothProfile.STATE_CONNECTED) showDevicePicker = false
-    }
-
+    // Device picker sheet
     if (showDevicePicker) {
         ModalBottomSheet(
             onDismissRequest = {
@@ -303,66 +273,41 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false),
             dragHandle = {
-                Box(
-                    modifier = Modifier
-                        .padding(top = 12.dp, bottom = 16.dp)
-                        .width(32.dp)
-                        .height(4.dp)
-                        .background(MaterialTheme.colorScheme.outline, CircleShape)
-                )
+                Box(modifier = Modifier.padding(top = 12.dp, bottom = 16.dp)
+                    .width(32.dp).height(4.dp).background(MaterialTheme.colorScheme.outline, CircleShape))
             }
         ) {
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(bottom = 24.dp),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 24.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                // Active Connection Info
+                // Active connection row
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 24.dp)
-                        .padding(bottom = 16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box(
-                            modifier = Modifier
-                                .size(48.dp)
+                            modifier = Modifier.size(48.dp)
                                 .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f), RoundedCornerShape(16.dp)),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(
-                                Icons.Default.Computer,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(24.dp)
-                            )
+                            Icon(Icons.Default.Computer, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
                         }
                         Column {
-                            Text(
-                                "Active Device",
+                            Text("Active Device",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = MaterialTheme.colorScheme.primary
-                            )
-                            Text(
-                                connectedDevice?.name ?: "None",
+                                color = MaterialTheme.colorScheme.primary)
+                            Text(connectedDevice?.name ?: "None",
                                 style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-                                color = MaterialTheme.colorScheme.onBackground
-                            )
+                                color = MaterialTheme.colorScheme.onBackground)
                         }
                     }
                     Button(
                         onClick = { viewModel.disconnect() },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = MaterialTheme.colorScheme.primary,
-                            contentColor = MaterialTheme.colorScheme.onPrimary
-                        ),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                         modifier = Modifier.height(36.dp),
                         contentPadding = PaddingValues(horizontal = 16.dp)
                     ) {
@@ -370,14 +315,10 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                     }
                 }
 
-                // Device List
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Make Discoverable button
                     val isConnecting = connectionState == BluetoothProfile.STATE_CONNECTING
                     Button(
                         onClick = { viewModel.startAdvertising() },
@@ -390,17 +331,13 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                         )
                     ) {
                         if (isConnecting) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp).padding(end = 0.dp),
-                                strokeWidth = 2.dp,
-                                color = MaterialTheme.colorScheme.onPrimary
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.onPrimary)
                             Spacer(Modifier.width(8.dp))
                             Text("Advertising — pair from your laptop's Bluetooth settings",
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                         } else {
-                            Icon(Icons.Default.Bluetooth, contentDescription = null,
-                                modifier = Modifier.size(16.dp))
+                            Icon(Icons.Default.Bluetooth, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(8.dp))
                             Text("Make Discoverable",
                                 style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold))
@@ -408,94 +345,196 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                     }
 
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).padding(top = 16.dp),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp).padding(top = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "Previously Paired",
+                        Text("Previously Paired",
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                         TextButton(
                             onClick = {
-                                val intent = Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
-                                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                try { context.startActivity(intent) } catch (_: Exception) {}
+                                try {
+                                    context.startActivity(Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                                } catch (_: Exception) {}
                             },
                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                             modifier = Modifier.height(28.dp)
                         ) {
-                            Text("Open BT Settings", style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
+                            Text("Open BT Settings",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold))
                         }
                     }
 
                     if (pairedDevices.isEmpty()) {
-                        Text(
-                            "No previously paired devices.\nTap \"Make Discoverable\", then add this device from your laptop's Bluetooth settings.",
+                        Text("No previously paired devices.\nTap \"Make Discoverable\", then add this device from your laptop's Bluetooth settings.",
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
-                        LazyColumn(
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             items(pairedDevices) { device ->
                                 Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(16.dp))
+                                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                                         .background(MaterialTheme.colorScheme.background)
-                                        .clickable {
-                                            viewModel.connectDevice(device)
-                                            showDevicePicker = false
-                                        }
+                                        .clickable { viewModel.connectDevice(device); showDevicePicker = false }
                                         .padding(horizontal = 20.dp, vertical = 18.dp),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            Icons.Default.Bluetooth,
-                                            contentDescription = null,
-                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Text(
-                                            device.name ?: "Unknown Device",
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Bluetooth, contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
+                                        Text(device.name ?: "Unknown Device", style = MaterialTheme.typography.bodySmall)
                                     }
-                                    if (device.address == connectedDevice?.address && connectionState == BluetoothProfile.STATE_CONNECTED) {
-                                        Text(
-                                            "CONNECTED",
-                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                letterSpacing = (-0.5).sp
-                                            ),
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    } else {
-                                        Text(
-                                            "PAIRED",
-                                            style = MaterialTheme.typography.labelSmall.copy(
-                                                fontSize = 10.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                letterSpacing = (-0.5).sp
-                                            ),
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
+                                    Text(
+                                        if (device.address == connectedDevice?.address && connectionState == BluetoothProfile.STATE_CONNECTED) "CONNECTED" else "PAIRED",
+                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
                                 }
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Settings sheet
+    if (showSettings) {
+        SettingsSheet(settings, viewModel, onDismiss = { showSettings = false })
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SettingsSheet(settings: Settings, viewModel: TouchpadViewModel, onDismiss: () -> Unit) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        dragHandle = {
+            Box(modifier = Modifier.padding(top = 12.dp, bottom = 8.dp)
+                .width(32.dp).height(4.dp).background(MaterialTheme.colorScheme.outline, CircleShape))
+        }
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 32.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp)
+        ) {
+            Text("Settings", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onSurface)
+
+            // Sensitivity segmented control
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Cursor Sensitivity",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val sensitivityOptions = listOf("Low" to 0.8f, "Medium" to 1.5f, "High" to 2.5f)
+                val selectedIndex = sensitivityOptions.indexOfFirst { it.second == settings.sensitivity }
+                    .takeIf { it >= 0 } ?: 1
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    sensitivityOptions.forEachIndexed { index, (label, value) ->
+                        SegmentedButton(
+                            selected = selectedIndex == index,
+                            onClick = { viewModel.updateSensitivity(value) },
+                            shape = SegmentedButtonDefaults.itemShape(index, sensitivityOptions.size),
+                            colors = SegmentedButtonDefaults.colors(
+                                activeContainerColor = MaterialTheme.colorScheme.primary,
+                                activeContentColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) { Text(label, style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
+            }
+
+            // Tap to click toggle
+            ListItem(
+                headlineContent = {
+                    Text("Tap to Left Click", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
+                },
+                supportingContent = {
+                    Text("Single tap on the touchpad sends a left click",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+                trailingContent = {
+                    Switch(checked = settings.tapToClick, onCheckedChange = { viewModel.updateTapToClick(it) })
+                },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
+            )
+
+            // Keyboard toggle
+            ListItem(
+                headlineContent = {
+                    Text("Phone Keyboard", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
+                },
+                supportingContent = {
+                    Text("Show keyboard button to type into the connected device",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+                trailingContent = {
+                    Switch(checked = settings.keyboardEnabled, onCheckedChange = { viewModel.updateKeyboardEnabled(it) })
+                },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
+            )
+        }
+    }
+}
+
+@Composable
+fun KeyboardInputArea(viewModel: TouchpadViewModel, onDismiss: () -> Unit) {
+    var inputText by remember { mutableStateOf("") }
+    val focusRequester = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        color = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(16.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, com.example.ui.theme.Border49454F)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            BasicTextField(
+                value = inputText,
+                onValueChange = { newText ->
+                    val old = inputText
+                    val commonLen = old.zip(newText).takeWhile { (a, b) -> a == b }.count()
+                    val deletedCount = old.length - commonLen
+                    val addedChars = newText.substring(commonLen)
+                    repeat(deletedCount) { viewModel.sendKeyReport(0, 0x2A); viewModel.sendKeyRelease() }
+                    addedChars.forEach { char ->
+                        val (mod, code) = charToHidKeycode(char)
+                        if (code != 0) { viewModel.sendKeyReport(mod, code); viewModel.sendKeyRelease() }
+                    }
+                    inputText = newText
+                },
+                modifier = Modifier.weight(1f).focusRequester(focusRequester),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = MaterialTheme.colorScheme.onSurface),
+                decorationBox = { inner ->
+                    if (inputText.isEmpty()) {
+                        Text("Type here to send keystrokes to your laptop…",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    inner()
+                },
+                singleLine = false
+            )
+            IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Default.KeyboardHide, contentDescription = "Dismiss keyboard",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(18.dp))
             }
         }
     }
@@ -505,24 +544,11 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
 @Composable
 fun ConnectionStatusPill(state: Int, device: BluetoothDevice?, onClick: () -> Unit = {}) {
     val (backgroundColor, text, isConnected) = when (state) {
-        BluetoothProfile.STATE_CONNECTED -> Triple(
-            MaterialTheme.colorScheme.primaryContainer,
-            "Connected",
-            true
-        )
-        BluetoothProfile.STATE_CONNECTING -> Triple(
-            MaterialTheme.colorScheme.tertiaryContainer,
-            "Connecting...",
-            false
-        )
-        else -> Triple(
-            com.example.ui.theme.Border49454F,
-            "Disconnected",
-            false
-        )
+        BluetoothProfile.STATE_CONNECTED  -> Triple(MaterialTheme.colorScheme.primaryContainer, "Connected", true)
+        BluetoothProfile.STATE_CONNECTING -> Triple(MaterialTheme.colorScheme.tertiaryContainer, "Connecting…", false)
+        else -> Triple(com.example.ui.theme.Border49454F, "Disconnected", false)
     }
-
-    val animatedColor by animateColorAsState(targetValue = backgroundColor, label = "Color")
+    val animatedColor by animateColorAsState(targetValue = backgroundColor, label = "pill")
 
     Surface(
         color = animatedColor,
@@ -532,55 +558,33 @@ fun ConnectionStatusPill(state: Int, device: BluetoothDevice?, onClick: () -> Un
             .animateContentSize(spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow))
             .clickable(onClick = onClick)
     ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-        ) {
-            if (isConnected) {
-                // Pulse dot
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .background(com.example.ui.theme.Pulse4F378B, CircleShape)
-                        .padding(end = 8.dp) // Wait, we can use spacer for spacing
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                )
-            } else if (state == BluetoothProfile.STATE_CONNECTING) {
-                CircularProgressIndicator(
-                    modifier = Modifier
-                        .size(12.dp)
-                        .padding(end = 6.dp),
-                    strokeWidth = 2.dp,
-                    color = MaterialTheme.colorScheme.onTertiaryContainer
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = MaterialTheme.colorScheme.onTertiaryContainer
-                )
-            } else {
-                Text(
-                    text = text,
-                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            when {
+                isConnected -> {
+                    Box(modifier = Modifier.size(8.dp).background(com.example.ui.theme.Pulse4F378B, CircleShape))
+                    Spacer(Modifier.width(8.dp))
+                    Text(text, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = MaterialTheme.colorScheme.onPrimaryContainer)
+                }
+                state == BluetoothProfile.STATE_CONNECTING -> {
+                    CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onTertiaryContainer)
+                    Spacer(Modifier.width(6.dp))
+                    Text(text, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                        color = MaterialTheme.colorScheme.onTertiaryContainer)
+                }
+                else -> Text(text, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
 
 @Composable
-fun TouchpadSurface(viewModel: TouchpadViewModel) {
+fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
     val haptic = LocalHapticFeedback.current
     var touchPoint by remember { mutableStateOf<Offset?>(null) }
-
-    val sensitivity = 1.5f
+    var scrollThumbFraction by remember { mutableFloatStateOf(0.33f) }
 
     Box(
         modifier = Modifier
@@ -588,132 +592,125 @@ fun TouchpadSurface(viewModel: TouchpadViewModel) {
             .clip(RoundedCornerShape(32.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .border(1.dp, com.example.ui.theme.Border49454F, RoundedCornerShape(32.dp))
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                        touchPoint = it
-                    },
-                    onDoubleTap = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                        touchPoint = it
-                    }
-                )
-            }
-            .pointerInput(Unit) {
-                awaitPointerEventScope {
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val pointers = event.changes
-                        if (pointers.isNotEmpty()) {
-                            val activePointers = pointers.filter { it.pressed }
-                            if (activePointers.isNotEmpty()) {
-                                touchPoint = activePointers.first().position
-
-                                if (activePointers.size == 1) {
-                                    val first = activePointers.first()
-                                    if (first.positionChange() != Offset.Zero) {
-                                        val dx = (first.positionChange().x * sensitivity).toInt()
-                                        val dy = (first.positionChange().y * sensitivity).toInt()
-                                        viewModel.sendMouseReport(false, false, dx, dy, 0)
-                                    }
-                                } else if (activePointers.size == 2) {
-                                    val avgChangeY = (activePointers[0].positionChange().y + activePointers[1].positionChange().y) / 2
-                                    val scrollAmount = (avgChangeY * -0.5f).toInt()
-                                    if (scrollAmount != 0) {
-                                        viewModel.sendMouseReport(false, false, 0, 0, scrollAmount)
-                                    }
+            .pointerInput(settings) {
+                coroutineScope {
+                    launch {
+                        detectTapGestures(
+                            onTap = { offset ->
+                                if (settings.tapToClick) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
                                 }
-                                event.changes.forEach { it.consume() }
-                            } else {
-                                touchPoint = null
+                                touchPoint = offset
+                            },
+                            onDoubleTap = { offset ->
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                                touchPoint = offset
                             }
-                        } else {
-                            touchPoint = null
+                        )
+                    }
+                    launch {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val active = event.changes.filter { it.pressed }
+                                if (active.isNotEmpty()) {
+                                    touchPoint = active.first().position
+                                    val scrollbarLeft = size.width - 44.dp.toPx()
+                                    when {
+                                        active.size >= 2 -> {
+                                            val avgY = (active[0].positionChange().y + active[1].positionChange().y) / 2
+                                            val scroll = (avgY * -0.5f).toInt()
+                                            if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
+                                            active.forEach { it.consume() }
+                                        }
+                                        active.size == 1 && active.first().position.x >= scrollbarLeft -> {
+                                            val dy = active.first().positionChange().y
+                                            if (dy != 0f) {
+                                                val scroll = (-dy * 0.1f).toInt()
+                                                if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
+                                                scrollThumbFraction = (scrollThumbFraction + dy / size.height).coerceIn(0f, 0.67f)
+                                                active.first().consume()
+                                            }
+                                        }
+                                        active.size == 1 -> {
+                                            val delta = active.first().positionChange()
+                                            if (delta != Offset.Zero) {
+                                                viewModel.sendMouseReport(false, false,
+                                                    (delta.x * settings.sensitivity).toInt(),
+                                                    (delta.y * settings.sensitivity).toInt(), 0)
+                                                active.first().consume()
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    touchPoint = null
+                                }
+                            }
                         }
                     }
                 }
             }
     ) {
-        // Glow Trail Effect (dynamic)
+        // Glow trail
         touchPoint?.let { offset ->
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawCircle(
                     brush = Brush.radialGradient(
-                        colors = listOf(
-                            Color(0xFFD0BCFF).copy(alpha = 0.12f),
-                            Color.Transparent
-                        ),
-                        center = offset,
-                        radius = 300f
+                        listOf(Color(0xFFD0BCFF).copy(alpha = 0.12f), Color.Transparent),
+                        center = offset, radius = 300f
                     ),
-                    radius = 300f,
-                    center = offset
+                    radius = 300f, center = offset
                 )
             }
         }
 
-        // Center Interaction Symbol
+        // Center hint
         Column(
-            modifier = Modifier
-                .align(Alignment.Center)
-                .alpha(0.3f), // opacity-30
+            modifier = Modifier.align(Alignment.Center).alpha(0.3f),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
-                modifier = Modifier
-                    .size(48.dp) // w-12 h-12
-                    .border(2.dp, com.example.ui.theme.TextSecondaryCAC4D0, CircleShape),
+                modifier = Modifier.size(48.dp).border(2.dp, com.example.ui.theme.TextSecondaryCAC4D0, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Box(modifier = Modifier.size(6.dp).background(com.example.ui.theme.TextSecondaryCAC4D0, CircleShape))
             }
-            Text(
-                text = "GLIDE TO MOVE",
+            Text("GLIDE TO MOVE",
                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Light, letterSpacing = 2.sp),
                 color = com.example.ui.theme.TextSecondaryCAC4D0,
-                modifier = Modifier.padding(top = 16.dp)
-            )
+                modifier = Modifier.padding(top = 16.dp))
         }
 
-        // Interactive Scroll Bar Simulation
+        // Functional scrollbar
         Box(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
-                .padding(end = 16.dp, top = 48.dp, bottom = 48.dp)
-                .width(6.dp) // w-1.5
+                .padding(end = 16.dp, top = 48.dp, bottom = 64.dp + 16.dp)
+                .width(6.dp)
                 .fillMaxHeight()
-                .background(com.example.ui.theme.Border49454F.copy(alpha = 0.5f), CircleShape)
+                .clip(CircleShape)
+                .background(com.example.ui.theme.Border49454F.copy(alpha = 0.5f))
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .fillMaxHeight(0.33f)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.6f), CircleShape)
-            )
+            Column(modifier = Modifier.fillMaxSize()) {
+                Spacer(modifier = Modifier.weight(scrollThumbFraction.coerceAtLeast(0.001f)))
+                Box(modifier = Modifier.fillMaxWidth().weight(0.33f)
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape))
+                Spacer(modifier = Modifier.weight((0.67f - scrollThumbFraction).coerceAtLeast(0.001f)))
+            }
         }
 
-        // Bottom Interaction Regions
+        // Click buttons at the bottom
         Row(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .height(64.dp) // h-16
+            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(64.dp)
         ) {
             Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
+                modifier = Modifier.weight(1f).fillMaxHeight()
                     .background(Color.Transparent)
-                    .border(
-                        width = 1.dp,
-                        color = com.example.ui.theme.Border49454F.copy(alpha = 0.3f),
-                        shape = RectangleShape
-                    )
+                    .border(1.dp, com.example.ui.theme.Border49454F.copy(alpha = 0.3f), RectangleShape)
                     .clickable {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
@@ -721,26 +718,14 @@ fun TouchpadSurface(viewModel: TouchpadViewModel) {
                     },
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = "LEFT CLICK",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = (-0.5).sp
-                    ),
-                    color = com.example.ui.theme.TextSecondaryCAC4D0
-                )
+                Text("LEFT CLICK",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                    color = com.example.ui.theme.TextSecondaryCAC4D0)
             }
             Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
+                modifier = Modifier.weight(1f).fillMaxHeight()
                     .background(Color.Transparent)
-                    .border(
-                        width = 1.dp,
-                        color = com.example.ui.theme.Border49454F.copy(alpha = 0.3f),
-                        shape = RectangleShape
-                    )
+                    .border(1.dp, com.example.ui.theme.Border49454F.copy(alpha = 0.3f), RectangleShape)
                     .clickable {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
@@ -748,18 +733,106 @@ fun TouchpadSurface(viewModel: TouchpadViewModel) {
                     },
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = "RIGHT CLICK",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = (-0.5).sp
-                    ),
-                    color = com.example.ui.theme.TextSecondaryCAC4D0
-                )
+                Text("RIGHT CLICK",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                    color = com.example.ui.theme.TextSecondaryCAC4D0)
             }
         }
     }
 }
 
+@SuppressLint("MissingPermission")
+@Composable
+fun QuickConnectOverlay(
+    connectionState: Int,
+    pairedDevices: List<BluetoothDevice>,
+    onConnect: (BluetoothDevice?) -> Unit,
+    onCancel: () -> Unit
+) {
+    val isConnecting = connectionState == BluetoothProfile.STATE_CONNECTING
+    val lastDevice = pairedDevices.firstOrNull()
 
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background.copy(alpha = 0.82f), RoundedCornerShape(32.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+            modifier = Modifier.padding(32.dp)
+        ) {
+            if (isConnecting) {
+                var showHint by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    delay(8000)
+                    showHint = true
+                }
+                CircularProgressIndicator(
+                    modifier = Modifier.size(36.dp),
+                    strokeWidth = 3.dp,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    "Waiting for laptop…",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (showHint) {
+                    Text(
+                        "Not connecting? On your laptop:\nSettings → Bluetooth → [your phone] → Connect",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 8.dp)
+                    )
+                }
+                TextButton(onClick = onCancel) {
+                    Text("Cancel", style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            } else {
+                Icon(
+                    Icons.Default.Bluetooth,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                    modifier = Modifier.size(40.dp)
+                )
+                if (lastDevice != null) {
+                    Button(
+                        onClick = { onConnect(lastDevice) },
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Icon(Icons.Default.Bluetooth, contentDescription = null,
+                            modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Connect to ${lastDevice.name ?: "Last Device"}",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                } else {
+                    Button(
+                        onClick = { onConnect(null) },
+                        shape = RoundedCornerShape(16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    ) {
+                        Icon(Icons.Default.Bluetooth, contentDescription = null,
+                            modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Make Discoverable",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold))
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun sensitivityLabel(value: Float) = when (value) {
+    0.8f -> "Low"
+    2.5f -> "High"
+    else -> "Medium"
+}
