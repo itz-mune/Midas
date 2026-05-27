@@ -2,6 +2,7 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
+// Dark scheme
 val Background1C1B1F = Color(0xFF1C1B1F)
 val Surface2B2930 = Color(0xFF2B2930)
 val TextE6E1E5 = Color(0xFFE6E1E5)
@@ -13,3 +14,12 @@ val Border49454F = Color(0xFF49454F)
 val TextSecondaryCAC4D0 = Color(0xFFCAC4D0)
 val ButtonBg36343B = Color(0xFF36343B)
 val OnPrimary381E72 = Color(0xFF381E72)
+
+// Light scheme
+val PrimaryLight = Color(0xFF6750A4)
+val OnPrimaryLight = Color(0xFFFFFFFF)
+val BackgroundLight = Color(0xFFFFFBFF)
+val OnBackgroundLight = Color(0xFF1C1B1F)
+val SurfaceVariantLight = Color(0xFFE7E0EC)
+val OnSurfaceVariantLight = Color(0xFF49454F)
+val OutlineLight = Color(0xFF79747E)

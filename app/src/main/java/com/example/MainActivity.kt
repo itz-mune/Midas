@@ -2,6 +2,10 @@ package com.example
 
 import android.Manifest
 import android.bluetooth.BluetoothDevice
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.bluetooth.BluetoothProfile
 import android.content.ComponentName
 import android.content.Context
@@ -13,6 +17,10 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.rememberUpdatedState
+import kotlin.math.abs
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
@@ -64,6 +72,9 @@ import kotlinx.coroutines.launch
 import androidx.compose.foundation.Canvas
 import android.annotation.SuppressLint
 
+private const val GYRO_SCALE = 12f
+private const val GYRO_DEAD_ZONE = 0.05f
+
 // Maps a character to (modifier, HID keycode). Returns (0, 0) for unmapped chars.
 private fun charToHidKeycode(char: Char): Pair<Int, Int> = when (char) {
     in 'a'..'z' -> 0 to (char.code - 'a'.code + 0x04)
@@ -102,7 +113,13 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             viewModel = viewModel()
-            MyApplicationTheme { MainScreen(viewModel, serviceConnection) }
+            val settings by viewModel.settings.collectAsState()
+            val darkTheme = when (settings.themeMode) {
+                ThemeMode.DARK -> true
+                ThemeMode.LIGHT -> false
+                ThemeMode.SYSTEM -> isSystemInDarkTheme()
+            }
+            MyApplicationTheme(darkTheme = darkTheme) { MainScreen(viewModel, serviceConnection) }
         }
     }
 
@@ -178,6 +195,30 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
         if (connectionState == BluetoothProfile.STATE_DISCONNECTED) showKeyboard = false
     }
 
+    // Gyro sensor — only active in GYRO mode while connected
+    if (settings.inputMode == InputMode.GYRO) {
+        val currentSensitivity = rememberUpdatedState(settings.sensitivity)
+        DisposableEffect(Unit) {
+            val sensorManager = context.getSystemService(SensorManager::class.java)
+            val gyro = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+            val listener = object : SensorEventListener {
+                override fun onSensorChanged(event: SensorEvent) {
+                    val scale = GYRO_SCALE * currentSensitivity.value
+                    // values[1] = Y-axis rotation (tilt left/right) → horizontal
+                    // values[0] = X-axis rotation (tilt up/down)    → vertical (inverted)
+                    val rawX = event.values[1]
+                    val rawY = event.values[0]
+                    val dx = if (abs(rawX) > GYRO_DEAD_ZONE) (-rawX * scale).toInt() else 0
+                    val dy = if (abs(rawY) > GYRO_DEAD_ZONE) (-rawY * scale).toInt() else 0
+                    if (dx != 0 || dy != 0) viewModel.sendMouseReport(false, false, dx, dy, 0)
+                }
+                override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+            }
+            if (gyro != null) sensorManager.registerListener(listener, gyro, SensorManager.SENSOR_DELAY_GAME)
+            onDispose { sensorManager?.unregisterListener(listener) }
+        }
+    }
+
     Scaffold(containerColor = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) { innerPadding ->
         Column(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
 
@@ -203,7 +244,11 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                 modifier = Modifier.weight(1f).padding(horizontal = 16.dp).padding(bottom = 16.dp)
             ) {
                 Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
-                    TouchpadSurface(viewModel, settings)
+                    if (settings.inputMode == InputMode.GYRO) {
+                        GyroControlSurface(viewModel, settings)
+                    } else {
+                        TouchpadSurface(viewModel, settings)
+                    }
                     if (connectionState != BluetoothProfile.STATE_CONNECTED) {
                         QuickConnectOverlay(
                             connectionState = connectionState,
@@ -234,12 +279,14 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                         // Settings button
                         IconButton(
                             onClick = { showSettings = true },
-                            modifier = Modifier.size(40.dp).background(com.example.ui.theme.ButtonBg36343B, CircleShape)
+                            modifier = Modifier.size(40.dp).background(MaterialTheme.colorScheme.surfaceVariant, CircleShape)
                         ) {
                             Icon(Icons.Default.Settings, contentDescription = "Settings",
                                 tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
                         }
-                        Text("Sensitivity: ${sensitivityLabel(settings.sensitivity)}",
+                        Text(
+                            if (settings.inputMode == InputMode.GYRO) "Gyro Speed: ${sensitivityLabel(settings.sensitivity)}"
+                            else "Sensitivity: ${sensitivityLabel(settings.sensitivity)}",
                             style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
@@ -249,7 +296,7 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
                         IconButton(
                             onClick = { showKeyboard = !showKeyboard },
                             modifier = Modifier.size(40.dp).background(
-                                if (showKeyboard) MaterialTheme.colorScheme.primary else com.example.ui.theme.ButtonBg36343B,
+                                if (showKeyboard) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                                 CircleShape
                             )
                         ) {
@@ -426,6 +473,50 @@ fun SettingsSheet(settings: Settings, viewModel: TouchpadViewModel, onDismiss: (
             Text("Settings", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                 color = MaterialTheme.colorScheme.onSurface)
 
+            // Theme segmented control
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Theme",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val themeOptions = listOf("System" to ThemeMode.SYSTEM, "Light" to ThemeMode.LIGHT, "Dark" to ThemeMode.DARK)
+                val selectedThemeIndex = themeOptions.indexOfFirst { it.second == settings.themeMode }.takeIf { it >= 0 } ?: 0
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    themeOptions.forEachIndexed { index, (label, mode) ->
+                        SegmentedButton(
+                            selected = selectedThemeIndex == index,
+                            onClick = { viewModel.updateTheme(mode) },
+                            shape = SegmentedButtonDefaults.itemShape(index, themeOptions.size),
+                            colors = SegmentedButtonDefaults.colors(
+                                activeContainerColor = MaterialTheme.colorScheme.primary,
+                                activeContentColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) { Text(label, style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
+            }
+
+            // Input mode segmented control
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Input Mode",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val inputOptions = listOf("Touchpad" to InputMode.TOUCHPAD, "Gyroscope" to InputMode.GYRO)
+                val selectedInputIndex = inputOptions.indexOfFirst { it.second == settings.inputMode }.takeIf { it >= 0 } ?: 0
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    inputOptions.forEachIndexed { index, (label, mode) ->
+                        SegmentedButton(
+                            selected = selectedInputIndex == index,
+                            onClick = { viewModel.updateInputMode(mode) },
+                            shape = SegmentedButtonDefaults.itemShape(index, inputOptions.size),
+                            colors = SegmentedButtonDefaults.colors(
+                                activeContainerColor = MaterialTheme.colorScheme.primary,
+                                activeContentColor = MaterialTheme.colorScheme.onPrimary
+                            )
+                        ) { Text(label, style = MaterialTheme.typography.labelMedium) }
+                    }
+                }
+            }
+
             // Sensitivity segmented control
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Cursor Sensitivity",
@@ -467,6 +558,42 @@ fun SettingsSheet(settings: Settings, viewModel: TouchpadViewModel, onDismiss: (
                     .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
             )
 
+            // Long press right click toggle
+            ListItem(
+                headlineContent = {
+                    Text("Long Press Right Click", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
+                },
+                supportingContent = {
+                    Text("Hold finger still to send a right click",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+                trailingContent = {
+                    Switch(checked = settings.longPressRightClick, onCheckedChange = { viewModel.updateLongPressRightClick(it) })
+                },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
+            )
+
+            // Haptic feedback toggle
+            ListItem(
+                headlineContent = {
+                    Text("Haptic Feedback", style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium))
+                },
+                supportingContent = {
+                    Text("Vibrate on left and right click",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                },
+                trailingContent = {
+                    Switch(checked = settings.hapticFeedback, onCheckedChange = { viewModel.updateHapticFeedback(it) })
+                },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
+                modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.5f))
+            )
+
             // Keyboard toggle
             ListItem(
                 headlineContent = {
@@ -499,7 +626,7 @@ fun KeyboardInputArea(viewModel: TouchpadViewModel, onDismiss: () -> Unit) {
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
         color = MaterialTheme.colorScheme.surface,
         shape = RoundedCornerShape(16.dp),
-        border = androidx.compose.foundation.BorderStroke(1.dp, com.example.ui.theme.Border49454F)
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -546,7 +673,7 @@ fun ConnectionStatusPill(state: Int, device: BluetoothDevice?, onClick: () -> Un
     val (backgroundColor, text, isConnected) = when (state) {
         BluetoothProfile.STATE_CONNECTED  -> Triple(MaterialTheme.colorScheme.primaryContainer, "Connected", true)
         BluetoothProfile.STATE_CONNECTING -> Triple(MaterialTheme.colorScheme.tertiaryContainer, "Connecting…", false)
-        else -> Triple(com.example.ui.theme.Border49454F, "Disconnected", false)
+        else -> Triple(MaterialTheme.colorScheme.surfaceVariant, "Disconnected", false)
     }
     val animatedColor by animateColorAsState(targetValue = backgroundColor, label = "pill")
 
@@ -561,7 +688,7 @@ fun ConnectionStatusPill(state: Int, device: BluetoothDevice?, onClick: () -> Un
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
             when {
                 isConnected -> {
-                    Box(modifier = Modifier.size(8.dp).background(com.example.ui.theme.Pulse4F378B, CircleShape))
+                    Box(modifier = Modifier.size(8.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
                     Spacer(Modifier.width(8.dp))
                     Text(text, style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
                         color = MaterialTheme.colorScheme.onPrimaryContainer)
@@ -583,6 +710,7 @@ fun ConnectionStatusPill(state: Int, device: BluetoothDevice?, onClick: () -> Un
 @Composable
 fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
     val haptic = LocalHapticFeedback.current
+    val glowColor = MaterialTheme.colorScheme.primary
     var touchPoint by remember { mutableStateOf<Offset?>(null) }
     var scrollThumbFraction by remember { mutableFloatStateOf(0.33f) }
 
@@ -591,23 +719,31 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             .fillMaxSize()
             .clip(RoundedCornerShape(32.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
-            .border(1.dp, com.example.ui.theme.Border49454F, RoundedCornerShape(32.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(32.dp))
             .pointerInput(settings) {
                 coroutineScope {
                     launch {
                         detectTapGestures(
                             onTap = { offset ->
                                 if (settings.tapToClick) {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
                                     viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
                                 }
                                 touchPoint = offset
                             },
                             onDoubleTap = { offset ->
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
                                 viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
                                 viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                                touchPoint = offset
+                            },
+                            onLongPress = { offset ->
+                                if (settings.longPressRightClick) {
+                                    if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                                }
                                 touchPoint = offset
                             }
                         )
@@ -660,7 +796,7 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawCircle(
                     brush = Brush.radialGradient(
-                        listOf(Color(0xFFD0BCFF).copy(alpha = 0.12f), Color.Transparent),
+                        listOf(glowColor.copy(alpha = 0.12f), Color.Transparent),
                         center = offset, radius = 300f
                     ),
                     radius = 300f, center = offset
@@ -674,14 +810,14 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
-                modifier = Modifier.size(48.dp).border(2.dp, com.example.ui.theme.TextSecondaryCAC4D0, CircleShape),
+                modifier = Modifier.size(48.dp).border(2.dp, MaterialTheme.colorScheme.onSurfaceVariant, CircleShape),
                 contentAlignment = Alignment.Center
             ) {
-                Box(modifier = Modifier.size(6.dp).background(com.example.ui.theme.TextSecondaryCAC4D0, CircleShape))
+                Box(modifier = Modifier.size(6.dp).background(MaterialTheme.colorScheme.onSurfaceVariant, CircleShape))
             }
             Text("GLIDE TO MOVE",
                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Light, letterSpacing = 2.sp),
-                color = com.example.ui.theme.TextSecondaryCAC4D0,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 16.dp))
         }
 
@@ -693,7 +829,7 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
                 .width(6.dp)
                 .fillMaxHeight()
                 .clip(CircleShape)
-                .background(com.example.ui.theme.Border49454F.copy(alpha = 0.5f))
+                .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
                 Spacer(modifier = Modifier.weight(scrollThumbFraction.coerceAtLeast(0.001f)))
@@ -710,9 +846,9 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             Box(
                 modifier = Modifier.weight(1f).fillMaxHeight()
                     .background(Color.Transparent)
-                    .border(1.dp, com.example.ui.theme.Border49454F.copy(alpha = 0.3f), RectangleShape)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
                     .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
                         viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
                     },
@@ -720,14 +856,14 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             ) {
                 Text("LEFT CLICK",
                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = com.example.ui.theme.TextSecondaryCAC4D0)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Box(
                 modifier = Modifier.weight(1f).fillMaxHeight()
                     .background(Color.Transparent)
-                    .border(1.dp, com.example.ui.theme.Border49454F.copy(alpha = 0.3f), RectangleShape)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
                     .clickable {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
                         viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
                     },
@@ -735,7 +871,7 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             ) {
                 Text("RIGHT CLICK",
                     style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = com.example.ui.theme.TextSecondaryCAC4D0)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -826,6 +962,154 @@ fun QuickConnectOverlay(
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold))
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun GyroControlSurface(viewModel: TouchpadViewModel, settings: Settings) {
+    val haptic = LocalHapticFeedback.current
+    var scrollThumbFraction by remember { mutableFloatStateOf(0.33f) }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(32.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(32.dp))
+    ) {
+        // Tap / long-press gesture zone — covers the surface minus buttons and scrollbar
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .padding(bottom = 72.dp, end = 44.dp)
+                .pointerInput(settings.tapToClick, settings.longPressRightClick, settings.hapticFeedback) {
+                    detectTapGestures(
+                        onTap = {
+                            if (settings.tapToClick) {
+                                if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                            }
+                        },
+                        onLongPress = {
+                            if (settings.longPressRightClick) {
+                                if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                            }
+                        }
+                    )
+                }
+        )
+
+        // Center hint
+        Column(
+            modifier = Modifier.align(Alignment.Center).alpha(0.3f).padding(bottom = 72.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(
+                modifier = Modifier.size(48.dp).border(2.dp, MaterialTheme.colorScheme.onSurfaceVariant, CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.ScreenRotation,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(24.dp)
+                )
+            }
+            Text(
+                "TILT TO MOVE",
+                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Light, letterSpacing = 2.sp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 16.dp)
+            )
+        }
+
+        // Scrollbar strip on the right
+        Box(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .width(44.dp)
+                .fillMaxHeight()
+                .padding(top = 24.dp, bottom = 72.dp)
+                .pointerInput(Unit) {
+                    awaitPointerEventScope {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val active = event.changes.filter { it.pressed }
+                            if (active.isNotEmpty()) {
+                                val dy = active.first().positionChange().y
+                                if (dy != 0f) {
+                                    val scroll = (-dy * 0.1f).toInt()
+                                    if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
+                                    scrollThumbFraction = (scrollThumbFraction + dy / size.height).coerceIn(0f, 0.67f)
+                                    active.first().consume()
+                                }
+                            }
+                        }
+                    }
+                }
+        ) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .width(6.dp)
+                    .fillMaxHeight()
+                    .padding(vertical = 16.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+            ) {
+                Column(modifier = Modifier.fillMaxSize()) {
+                    Spacer(modifier = Modifier.weight(scrollThumbFraction.coerceAtLeast(0.001f)))
+                    Box(
+                        modifier = Modifier.fillMaxWidth().weight(0.33f)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape)
+                    )
+                    Spacer(modifier = Modifier.weight((0.67f - scrollThumbFraction).coerceAtLeast(0.001f)))
+                }
+            }
+        }
+
+        // Left + right click buttons along the bottom
+        Row(
+            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(72.dp)
+        ) {
+            Box(
+                modifier = Modifier.weight(1f).fillMaxHeight()
+                    .background(Color.Transparent)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
+                    .clickable {
+                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "LEFT CLICK",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Box(
+                modifier = Modifier.weight(1f).fillMaxHeight()
+                    .background(Color.Transparent)
+                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
+                    .clickable {
+                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "RIGHT CLICK",
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }

@@ -34,7 +34,6 @@ class HidManager(private val context: Context) {
     private var mouseReportChar: BluetoothGattCharacteristic? = null
     private var keyboardReportChar: BluetoothGattCharacteristic? = null
     private var connectedGattDevice: BluetoothDevice? = null
-    private var clientGatt: BluetoothGatt? = null
 
     private val enabledNotifications = mutableSetOf<BluetoothGattCharacteristic>()
 
@@ -44,19 +43,6 @@ class HidManager(private val context: Context) {
         override fun onReceive(context: Context, intent: Intent) {
             val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
             if (state == BluetoothDevice.BOND_BONDED) updatePairedDevices()
-        }
-    }
-
-    // Opened alongside the GATT server so we can call requestConnectionPriority(HIGH).
-    // As a peripheral-only GATT server Android negotiates lazy power-saving connection
-    // intervals; the client-side call forces the controller to use ~11ms intervals instead,
-    // which prevents the BLE link from dropping under normal use.
-    private val clientGattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                Log.d(TAG, "Client GATT connected — requested HIGH connection priority")
-            }
         }
     }
 
@@ -76,11 +62,6 @@ class HidManager(private val context: Context) {
                     mouseReportChar?.let { enabledNotifications.add(it) }
                     keyboardReportChar?.let { enabledNotifications.add(it) }
                     updatePairedDevices()
-                    // Open a client GATT so we can request HIGH connection priority.
-                    // Android's peripheral-only role defaults to lazy intervals; this
-                    // forces ~11ms intervals and eliminates spurious disconnects.
-                    clientGatt?.close()
-                    clientGatt = device.connectGatt(context, false, clientGattCallback)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (connectedGattDevice?.address == device.address) {
@@ -88,8 +69,6 @@ class HidManager(private val context: Context) {
                         enabledNotifications.clear()
                         _connectedDevice.value = null
                         _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
-                        clientGatt?.close()
-                        clientGatt = null
                         updatePairedDevices()
                     }
                 }
@@ -233,7 +212,15 @@ class HidManager(private val context: Context) {
         }
     }
 
-    fun connect(device: BluetoothDevice) = startAdvertising()
+    fun connect(device: BluetoothDevice) {
+        startAdvertising()
+        // Directed advertising: as a BLE peripheral, gattServer.connect() sends
+        // ADV_DIRECT_IND targeted at this specific device. Windows responds to
+        // directed advertising even when not actively scanning, so the laptop
+        // reconnects without the user needing to open Bluetooth settings.
+        // Undirected advertising (from startAdvertising) runs concurrently as fallback.
+        gattServer?.connect(device, false)
+    }
 
     fun disconnect() {
         pendingAdvertise = false
@@ -303,8 +290,6 @@ class HidManager(private val context: Context) {
     fun cleanup() {
         stopAdvertising()
         try { context.unregisterReceiver(bondReceiver) } catch (_: Exception) {}
-        clientGatt?.close()
-        clientGatt = null
         // Don't explicitly close the GATT server — let process death trigger a
         // supervision timeout on Windows's side rather than a clean LL_TERMINATE_IND.
         // Supervision timeout = "device disappeared" → Windows auto-reconnects next time.

@@ -1,22 +1,34 @@
 package com.example
 
 import android.annotation.SuppressLint
+import android.app.Application
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothProfile
-import androidx.lifecycle.ViewModel
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+enum class InputMode { TOUCHPAD, GYRO }
+
 data class Settings(
     val sensitivity: Float = 1.5f,
     val tapToClick: Boolean = true,
-    val keyboardEnabled: Boolean = true
+    val longPressRightClick: Boolean = true,
+    val hapticFeedback: Boolean = true,
+    val keyboardEnabled: Boolean = true,
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    val inputMode: InputMode = InputMode.TOUCHPAD
 )
 
-class TouchpadViewModel : ViewModel() {
+class TouchpadViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val prefs = application.getSharedPreferences("midas_settings", Context.MODE_PRIVATE)
+
     private var hidService: BluetoothHidService? = null
 
     val isServiceConnected = MutableStateFlow(false)
@@ -24,8 +36,30 @@ class TouchpadViewModel : ViewModel() {
     val connectedDevice: StateFlow<BluetoothDevice?> = MutableStateFlow(null)
     val pairedDevices: StateFlow<List<BluetoothDevice>> = MutableStateFlow(emptyList())
 
-    private val _settings = MutableStateFlow(Settings())
+    private val _settings = MutableStateFlow(loadSettings())
     val settings: StateFlow<Settings> = _settings.asStateFlow()
+
+    private fun loadSettings() = Settings(
+        sensitivity = prefs.getFloat("sensitivity", 1.5f),
+        tapToClick = prefs.getBoolean("tap_to_click", true),
+        longPressRightClick = prefs.getBoolean("long_press_right_click", true),
+        hapticFeedback = prefs.getBoolean("haptic_feedback", true),
+        keyboardEnabled = prefs.getBoolean("keyboard_enabled", true),
+        themeMode = try { ThemeMode.valueOf(prefs.getString("theme_mode", ThemeMode.SYSTEM.name)!!) } catch (_: Exception) { ThemeMode.SYSTEM },
+        inputMode = try { InputMode.valueOf(prefs.getString("input_mode", InputMode.TOUCHPAD.name)!!) } catch (_: Exception) { InputMode.TOUCHPAD }
+    )
+
+    private fun save(s: Settings) {
+        prefs.edit()
+            .putFloat("sensitivity", s.sensitivity)
+            .putBoolean("tap_to_click", s.tapToClick)
+            .putBoolean("long_press_right_click", s.longPressRightClick)
+            .putBoolean("haptic_feedback", s.hapticFeedback)
+            .putBoolean("keyboard_enabled", s.keyboardEnabled)
+            .putString("theme_mode", s.themeMode.name)
+            .putString("input_mode", s.inputMode.name)
+            .apply()
+    }
 
     @SuppressLint("MissingPermission")
     fun attachService(service: BluetoothHidService) {
@@ -61,9 +95,15 @@ class TouchpadViewModel : ViewModel() {
     fun sendKeyReport(modifier: Int, keycode: Int) = hidService?.hidManager?.sendKeyReport(modifier, keycode)
     fun sendKeyRelease() = hidService?.hidManager?.sendKeyReport(0, 0)
 
-    fun updateSensitivity(value: Float) { _settings.value = _settings.value.copy(sensitivity = value) }
-    fun updateTapToClick(value: Boolean) { _settings.value = _settings.value.copy(tapToClick = value) }
-    fun updateKeyboardEnabled(value: Boolean) { _settings.value = _settings.value.copy(keyboardEnabled = value) }
+    fun updateSensitivity(value: Float) { update(_settings.value.copy(sensitivity = value)) }
+    fun updateTapToClick(value: Boolean) { update(_settings.value.copy(tapToClick = value)) }
+    fun updateLongPressRightClick(value: Boolean) { update(_settings.value.copy(longPressRightClick = value)) }
+    fun updateHapticFeedback(value: Boolean) { update(_settings.value.copy(hapticFeedback = value)) }
+    fun updateKeyboardEnabled(value: Boolean) { update(_settings.value.copy(keyboardEnabled = value)) }
+    fun updateTheme(mode: ThemeMode) { update(_settings.value.copy(themeMode = mode)) }
+    fun updateInputMode(mode: InputMode) { update(_settings.value.copy(inputMode = mode)) }
+
+    private fun update(s: Settings) { _settings.value = s; save(s) }
 
     override fun onCleared() {
         super.onCleared()
