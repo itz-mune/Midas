@@ -1,0 +1,6 @@
+{
+  "name": "Midas",
+  "description": "Turns your Android device into a Bluetooth HID touchpad.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
