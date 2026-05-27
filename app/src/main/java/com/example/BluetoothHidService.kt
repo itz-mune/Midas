@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +22,7 @@ class BluetoothHidService : Service() {
         private set
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var wakeLock: PowerManager.WakeLock? = null
 
     inner class LocalBinder : Binder() {
         fun getService(): BluetoothHidService = this@BluetoothHidService
@@ -31,6 +33,9 @@ class BluetoothHidService : Service() {
         hidManager = HidManager(this)
         hidManager.init()
         createNotificationChannel()
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Midas:BleKeepAlive")
+        wakeLock?.acquire()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -51,6 +56,8 @@ class BluetoothHidService : Service() {
         super.onDestroy()
         hidManager.cleanup()
         serviceScope.cancel()
+        wakeLock?.release()
+        wakeLock = null
     }
 
     private fun createNotificationChannel() {
