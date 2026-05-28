@@ -28,7 +28,10 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -71,6 +74,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.Canvas
 import android.annotation.SuppressLint
+import androidx.compose.ui.graphics.vector.ImageVector
 
 private const val GYRO_SCALE = 12f
 private const val GYRO_DEAD_ZONE = 0.05f
@@ -185,6 +189,8 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
     val connectedDevice by viewModel.connectedDevice.collectAsState()
     val pairedDevices by viewModel.pairedDevices.collectAsState()
     val settings by viewModel.settings.collectAsState()
+    val onboardingShown by viewModel.onboardingShown.collectAsState()
+    val showReconnectPrompt by viewModel.showReconnectPrompt.collectAsState()
 
     var showDevicePicker by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -453,6 +459,22 @@ fun TouchpadApp(viewModel: TouchpadViewModel) {
     if (showSettings) {
         SettingsSheet(settings, viewModel, onDismiss = { showSettings = false })
     }
+
+    // Reconnect guidance (shown on unexpected disconnect)
+    if (showReconnectPrompt) {
+        ReconnectHintSheet(
+            onDismiss = { viewModel.dismissReconnectPrompt() },
+            onMakeDiscoverable = {
+                viewModel.dismissReconnectPrompt()
+                viewModel.startAdvertising()
+            }
+        )
+    }
+
+    // First-time onboarding (fullscreen overlay, drawn last so it's on top)
+    if (!onboardingShown) {
+        OnboardingOverlay(onDone = { viewModel.markOnboardingShown() })
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -713,6 +735,11 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
     val glowColor = MaterialTheme.colorScheme.primary
     var touchPoint by remember { mutableStateOf<Offset?>(null) }
     var scrollThumbFraction by remember { mutableFloatStateOf(0.33f) }
+    var leftClickPressed by remember { mutableStateOf(false) }
+    val leftClickBg by animateColorAsState(
+        targetValue = if (leftClickPressed) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent,
+        label = "leftClickBg"
+    )
 
     Box(
         modifier = Modifier
@@ -720,158 +747,165 @@ fun TouchpadSurface(viewModel: TouchpadViewModel, settings: Settings) {
             .clip(RoundedCornerShape(32.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(32.dp))
-            .pointerInput(settings) {
-                coroutineScope {
-                    launch {
-                        detectTapGestures(
-                            onTap = { offset ->
-                                if (settings.tapToClick) {
-                                    if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
-                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                                }
-                                touchPoint = offset
-                            },
-                            onDoubleTap = { offset ->
-                                if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
-                                viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                                touchPoint = offset
-                            },
-                            onLongPress = { offset ->
-                                if (settings.longPressRightClick) {
-                                    if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
-                                    viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                                }
-                                touchPoint = offset
+    ) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            // Gesture area — pointerInput only covers this section, not the button row
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .pointerInput(settings) {
+                        coroutineScope {
+                            launch {
+                                detectTapGestures(
+                                    onTap = { offset ->
+                                        if (settings.tapToClick) {
+                                            if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                                            viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                                        }
+                                        touchPoint = offset
+                                    },
+                                    onLongPress = { offset ->
+                                        if (settings.longPressRightClick) {
+                                            if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                                            viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                                        }
+                                        touchPoint = offset
+                                    }
+                                )
                             }
-                        )
-                    }
-                    launch {
-                        awaitPointerEventScope {
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val active = event.changes.filter { it.pressed }
-                                if (active.isNotEmpty()) {
-                                    touchPoint = active.first().position
-                                    val scrollbarLeft = size.width - 44.dp.toPx()
-                                    when {
-                                        active.size >= 2 -> {
-                                            val avgY = (active[0].positionChange().y + active[1].positionChange().y) / 2
-                                            val scroll = (avgY * -0.5f).toInt()
-                                            if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
-                                            active.forEach { it.consume() }
-                                        }
-                                        active.size == 1 && active.first().position.x >= scrollbarLeft -> {
-                                            val dy = active.first().positionChange().y
-                                            if (dy != 0f) {
-                                                val scroll = (-dy * 0.1f).toInt()
-                                                if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
-                                                scrollThumbFraction = (scrollThumbFraction + dy / size.height).coerceIn(0f, 0.67f)
-                                                active.first().consume()
+                            launch {
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val active = event.changes.filter { it.pressed }
+                                        if (active.isNotEmpty()) {
+                                            touchPoint = active.first().position
+                                            val scrollbarLeft = size.width - 44.dp.toPx()
+                                            when {
+                                                active.size >= 2 -> {
+                                                    val avgY = (active[0].positionChange().y + active[1].positionChange().y) / 2
+                                                    val scroll = (avgY * -0.5f).toInt()
+                                                    if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
+                                                    active.forEach { it.consume() }
+                                                }
+                                                active.size == 1 && active.first().position.x >= scrollbarLeft -> {
+                                                    val dy = active.first().positionChange().y
+                                                    if (dy != 0f) {
+                                                        val scroll = (-dy * 0.1f).toInt()
+                                                        if (scroll != 0) viewModel.sendMouseReport(false, false, 0, 0, scroll)
+                                                        scrollThumbFraction = (scrollThumbFraction + dy / size.height).coerceIn(0f, 0.67f)
+                                                        active.first().consume()
+                                                    }
+                                                }
+                                                active.size == 1 -> {
+                                                    val delta = active.first().positionChange()
+                                                    if (delta != Offset.Zero) {
+                                                        viewModel.sendMouseReport(false, false,
+                                                            (delta.x * settings.sensitivity).toInt(),
+                                                            (delta.y * settings.sensitivity).toInt(), 0)
+                                                        active.first().consume()
+                                                    }
+                                                }
                                             }
-                                        }
-                                        active.size == 1 -> {
-                                            val delta = active.first().positionChange()
-                                            if (delta != Offset.Zero) {
-                                                viewModel.sendMouseReport(false, false,
-                                                    (delta.x * settings.sensitivity).toInt(),
-                                                    (delta.y * settings.sensitivity).toInt(), 0)
-                                                active.first().consume()
-                                            }
+                                        } else {
+                                            touchPoint = null
                                         }
                                     }
-                                } else {
-                                    touchPoint = null
                                 }
                             }
                         }
                     }
+            ) {
+                // Glow trail
+                touchPoint?.let { offset ->
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawCircle(
+                            brush = Brush.radialGradient(
+                                listOf(glowColor.copy(alpha = 0.12f), Color.Transparent),
+                                center = offset, radius = 300f
+                            ),
+                            radius = 300f, center = offset
+                        )
+                    }
+                }
+
+                // Center hint
+                Column(
+                    modifier = Modifier.align(Alignment.Center).alpha(0.3f),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        modifier = Modifier.size(48.dp).border(2.dp, MaterialTheme.colorScheme.onSurfaceVariant, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Box(modifier = Modifier.size(6.dp).background(MaterialTheme.colorScheme.onSurfaceVariant, CircleShape))
+                    }
+                    Text("GLIDE TO MOVE",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Light, letterSpacing = 2.sp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 16.dp))
+                }
+
+                // Functional scrollbar
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 16.dp, top = 48.dp, bottom = 16.dp)
+                        .width(6.dp)
+                        .fillMaxHeight()
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
+                ) {
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        Spacer(modifier = Modifier.weight(scrollThumbFraction.coerceAtLeast(0.001f)))
+                        Box(modifier = Modifier.fillMaxWidth().weight(0.33f)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape))
+                        Spacer(modifier = Modifier.weight((0.67f - scrollThumbFraction).coerceAtLeast(0.001f)))
+                    }
                 }
             }
-    ) {
-        // Glow trail
-        touchPoint?.let { offset ->
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        listOf(glowColor.copy(alpha = 0.12f), Color.Transparent),
-                        center = offset, radius = 300f
-                    ),
-                    radius = 300f, center = offset
-                )
-            }
-        }
 
-        // Center hint
-        Column(
-            modifier = Modifier.align(Alignment.Center).alpha(0.3f),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
-                modifier = Modifier.size(48.dp).border(2.dp, MaterialTheme.colorScheme.onSurfaceVariant, CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                Box(modifier = Modifier.size(6.dp).background(MaterialTheme.colorScheme.onSurfaceVariant, CircleShape))
-            }
-            Text("GLIDE TO MOVE",
-                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Light, letterSpacing = 2.sp),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 16.dp))
-        }
-
-        // Functional scrollbar
-        Box(
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .padding(end = 16.dp, top = 48.dp, bottom = 64.dp + 16.dp)
-                .width(6.dp)
-                .fillMaxHeight()
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
-        ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                Spacer(modifier = Modifier.weight(scrollThumbFraction.coerceAtLeast(0.001f)))
-                Box(modifier = Modifier.fillMaxWidth().weight(0.33f)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.7f), CircleShape))
-                Spacer(modifier = Modifier.weight((0.67f - scrollThumbFraction).coerceAtLeast(0.001f)))
-            }
-        }
-
-        // Click buttons at the bottom
-        Row(
-            modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(64.dp)
-        ) {
-            Box(
-                modifier = Modifier.weight(1f).fillMaxHeight()
-                    .background(Color.Transparent)
-                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
-                    .clickable {
-                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Text("LEFT CLICK",
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Box(
-                modifier = Modifier.weight(1f).fillMaxHeight()
-                    .background(Color.Transparent)
-                    .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
-                    .clickable {
-                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                Text("RIGHT CLICK",
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // Click buttons — outside the gesture area's pointerInput
+            Row(modifier = Modifier.fillMaxWidth().height(64.dp)) {
+                Box(
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                        .background(leftClickBg)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
+                        .pointerInput(settings) {
+                            awaitEachGesture {
+                                awaitFirstDown()
+                                leftClickPressed = true
+                                if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                                waitForUpOrCancellation()
+                                leftClickPressed = false
+                                viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("LEFT CLICK",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Box(
+                    modifier = Modifier.weight(1f).fillMaxHeight()
+                        .background(Color.Transparent)
+                        .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
+                        .clickable {
+                            if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            viewModel.sendMouseReport(leftBtn = false, rightBtn = true, 0, 0, 0)
+                            viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("RIGHT CLICK",
+                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -971,6 +1005,11 @@ fun QuickConnectOverlay(
 fun GyroControlSurface(viewModel: TouchpadViewModel, settings: Settings) {
     val haptic = LocalHapticFeedback.current
     var scrollThumbFraction by remember { mutableFloatStateOf(0.33f) }
+    var leftClickPressed by remember { mutableStateOf(false) }
+    val leftClickBg by animateColorAsState(
+        targetValue = if (leftClickPressed) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else Color.Transparent,
+        label = "leftClickBg"
+    )
 
     Box(
         modifier = Modifier
@@ -1079,12 +1118,18 @@ fun GyroControlSurface(viewModel: TouchpadViewModel, settings: Settings) {
         ) {
             Box(
                 modifier = Modifier.weight(1f).fillMaxHeight()
-                    .background(Color.Transparent)
+                    .background(leftClickBg)
                     .border(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.3f), RectangleShape)
-                    .clickable {
-                        if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
-                        viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                    .pointerInput(settings) {
+                        awaitEachGesture {
+                            awaitFirstDown()
+                            leftClickPressed = true
+                            if (settings.hapticFeedback) haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            viewModel.sendMouseReport(leftBtn = true, rightBtn = false, 0, 0, 0)
+                            waitForUpOrCancellation()
+                            leftClickPressed = false
+                            viewModel.sendMouseReport(leftBtn = false, rightBtn = false, 0, 0, 0)
+                        }
                     },
                 contentAlignment = Alignment.Center
             ) {
@@ -1119,4 +1164,252 @@ private fun sensitivityLabel(value: Float) = when (value) {
     0.8f -> "Low"
     2.5f -> "High"
     else -> "Medium"
+}
+
+// ── Onboarding ────────────────────────────────────────────────────────────────
+
+private data class OnboardingPage(val icon: ImageVector, val title: String, val body: String)
+
+@Composable
+fun OnboardingOverlay(onDone: () -> Unit) {
+    val pages = remember {
+        listOf(
+            OnboardingPage(Icons.Default.Mouse, "Welcome to MIDAS",
+                "Your phone becomes a wireless Bluetooth trackpad for any laptop or PC."),
+            OnboardingPage(Icons.Default.TouchApp, "Swipe · Tap · Scroll",
+                "Drag one finger to move the cursor. Tap to left-click. Two-finger swipe to scroll. Long-press to right-click."),
+            OnboardingPage(Icons.Default.Bluetooth, "Pair Your Laptop",
+                "Tap \"Make Discoverable\", then open Bluetooth on your laptop and select your phone to pair.")
+        )
+    }
+    var page by remember { mutableIntStateOf(0) }
+    val current = pages[page]
+    val isLast = page == pages.lastIndex
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        // Spotlight circle (partially off-screen at top, like the reference)
+        Box(
+            modifier = Modifier
+                .size(440.dp)
+                .offset(y = (-72).dp)
+                .align(Alignment.TopCenter)
+                .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = current.icon,
+                contentDescription = null,
+                modifier = Modifier.size(96.dp).offset(y = 36.dp),
+                tint = MaterialTheme.colorScheme.onPrimaryContainer
+            )
+        }
+
+        // Bottom content card
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .fillMaxWidth()
+                .padding(horizontal = 28.dp)
+                .padding(bottom = 52.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                current.title,
+                style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                current.body,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 8.dp)
+            )
+
+            Spacer(Modifier.height(4.dp))
+
+            // Pill dot indicators
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                pages.indices.forEach { i ->
+                    val active = i == page
+                    Box(
+                        modifier = Modifier
+                            .height(8.dp)
+                            .width(if (active) 24.dp else 8.dp)
+                            .background(
+                                if (active) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.outline,
+                                CircleShape
+                            )
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Button(
+                onClick = { if (isLast) onDone() else page++ },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    if (isLast) "Get Started" else "Next",
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+
+            if (!isLast) {
+                TextButton(onClick = onDone) {
+                    Text(
+                        "Skip",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ── Reconnect hint ─────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReconnectHintSheet(onDismiss: () -> Unit, onMakeDiscoverable: () -> Unit) {
+    val context = LocalContext.current
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 12.dp, bottom = 8.dp)
+                    .width(32.dp)
+                    .height(4.dp)
+                    .background(MaterialTheme.colorScheme.outline, CircleShape)
+            )
+        }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 40.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            // Header
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Default.BluetoothDisabled,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Column {
+                    Text(
+                        "Connection Lost",
+                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        "Your laptop dropped the connection",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f))
+
+            Text(
+                "To reconnect cleanly:",
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            val steps = listOf(
+                "On your laptop, open Bluetooth settings and forget / remove this phone.",
+                "On this phone, open Bluetooth settings and forget your laptop.",
+                "Tap \"Make Discoverable\" below, then re-pair from your laptop."
+            )
+            steps.forEachIndexed { i, step ->
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .background(MaterialTheme.colorScheme.primaryContainer, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "${i + 1}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                    Text(
+                        step,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(4.dp))
+
+            Button(
+                onClick = onMakeDiscoverable,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Icon(Icons.Default.Bluetooth, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "Make Discoverable",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+
+            OutlinedButton(
+                onClick = {
+                    try {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    } catch (_: Exception) {}
+                    onDismiss()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Text(
+                    "Open Bluetooth Settings",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                )
+            }
+        }
+    }
 }

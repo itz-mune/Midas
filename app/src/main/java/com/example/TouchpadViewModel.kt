@@ -36,6 +36,9 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
     val connectedDevice: StateFlow<BluetoothDevice?> = MutableStateFlow(null)
     val pairedDevices: StateFlow<List<BluetoothDevice>> = MutableStateFlow(emptyList())
 
+    val onboardingShown = MutableStateFlow(prefs.getBoolean("onboarding_shown", false))
+    val showReconnectPrompt = MutableStateFlow(false)
+
     private val _settings = MutableStateFlow(loadSettings())
     val settings: StateFlow<Settings> = _settings.asStateFlow()
 
@@ -66,8 +69,13 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         hidService = service
         isServiceConnected.value = true
         viewModelScope.launch {
-            service.hidManager.connectionState.collect {
-                (connectionState as MutableStateFlow).value = it
+            var prev = BluetoothProfile.STATE_DISCONNECTED
+            service.hidManager.connectionState.collect { state ->
+                if (prev == BluetoothProfile.STATE_CONNECTED && state == BluetoothProfile.STATE_DISCONNECTED) {
+                    showReconnectPrompt.value = true
+                }
+                prev = state
+                (connectionState as MutableStateFlow).value = state
             }
         }
         viewModelScope.launch {
@@ -82,6 +90,13 @@ class TouchpadViewModel(application: Application) : AndroidViewModel(application
         }
         service.hidManager.updatePairedDevices()
     }
+
+    fun markOnboardingShown() {
+        prefs.edit().putBoolean("onboarding_shown", true).apply()
+        onboardingShown.value = true
+    }
+
+    fun dismissReconnectPrompt() { showReconnectPrompt.value = false }
 
     fun updatePairedDevices() = hidService?.hidManager?.updatePairedDevices()
     fun connectDevice(device: BluetoothDevice) = hidService?.hidManager?.connect(device)

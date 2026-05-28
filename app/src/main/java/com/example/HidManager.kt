@@ -10,10 +10,19 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.ParcelUuid
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 
+@Suppress("DEPRECATION")
 @SuppressLint("MissingPermission")
 class HidManager(private val context: Context) {
     private val bluetoothManager = context.getSystemService(BluetoothManager::class.java)
@@ -34,6 +43,8 @@ class HidManager(private val context: Context) {
     private var mouseReportChar: BluetoothGattCharacteristic? = null
     private var keyboardReportChar: BluetoothGattCharacteristic? = null
     private var connectedGattDevice: BluetoothDevice? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var keepAliveJob: Job? = null
 
     private val enabledNotifications = mutableSetOf<BluetoothGattCharacteristic>()
 
@@ -62,6 +73,7 @@ class HidManager(private val context: Context) {
                     mouseReportChar?.let { enabledNotifications.add(it) }
                     keyboardReportChar?.let { enabledNotifications.add(it) }
                     updatePairedDevices()
+                    startKeepAlive(device)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     if (connectedGattDevice?.address == device.address) {
@@ -69,6 +81,8 @@ class HidManager(private val context: Context) {
                         enabledNotifications.clear()
                         _connectedDevice.value = null
                         _connectionState.value = BluetoothProfile.STATE_DISCONNECTED
+                        keepAliveJob?.cancel()
+                        keepAliveJob = null
                         updatePairedDevices()
                     }
                 }
@@ -287,8 +301,30 @@ class HidManager(private val context: Context) {
         }
     }
 
+    private fun startKeepAlive(device: BluetoothDevice) {
+        keepAliveJob?.cancel()
+        keepAliveJob = scope.launch {
+            while (isActive) {
+                delay(3_000)
+                if (_connectionState.value == BluetoothProfile.STATE_CONNECTED) {
+                    // Zero mouse report — no movement, no clicks. Keeps the GATT
+                    // notification channel active so Android's BLE radio doesn't
+                    // reduce power on the link and trigger a supervision timeout.
+                    mouseReportChar?.let { char ->
+                        if (enabledNotifications.contains(char)) {
+                            notify(device, char, byteArrayOf(0, 0, 0, 0))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fun cleanup() {
         stopAdvertising()
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+        scope.cancel()
         try { context.unregisterReceiver(bondReceiver) } catch (_: Exception) {}
         // Don't explicitly close the GATT server — let process death trigger a
         // supervision timeout on Windows's side rather than a clean LL_TERMINATE_IND.
