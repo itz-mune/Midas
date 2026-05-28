@@ -7,16 +7,19 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+val appVersion = "1.0"
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
+  setProperty("archivesBaseName", "midas-v$appVersion")
 
   defaultConfig {
     applicationId = "com.aistudio.touchpad.vnhdj"
     minSdk = 28
     targetSdk = 36
     versionCode = 1
-    versionName = "1.0"
+    versionName = appVersion
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
