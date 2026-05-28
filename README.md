@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="app/src/main/ic_launcher-playstore.png" width="120" height="120" alt="MIDAS icon" />
+
 <h1>MIDAS</h1>
 <p><strong>Turn your Android phone into a wireless Bluetooth touchpad & mouse</strong></p>
 
