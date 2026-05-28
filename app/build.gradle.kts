@@ -9,10 +9,11 @@ plugins {
 
 val appVersion = "1.0"
 
+base.archivesName.set("midas-v$appVersion")
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
-  setProperty("archivesBaseName", "midas-v$appVersion")
 
   defaultConfig {
     applicationId = "com.aistudio.touchpad.vnhdj"
